@@ -1,0 +1,206 @@
+// ReSharper disable CppInconsistentNaming
+// ReSharper disable CppParameterMayBeConst
+
+#pragma kernel CSMain
+
+RWBuffer<float4> _Result;
+// Packed data of cubes
+// - Vector3 rotation
+// - float scale
+RWStructuredBuffer<float4> _Data;
+
+cbuffer _RenderData
+{
+    float3 _CameraPos;
+    float3 _CameraDir;
+    float2 _Resolution;
+    int    _NumCubes;
+
+    float3 _SmallCubeRotation;
+    float  _SmallCubeScale;
+}
+
+float2 GetUV (uint3 id) {
+    return float2(id.x / 256.0, id.y / 256.0);
+}
+
+float4x4 translate(float3 v) {
+    return float4x4(
+        1, 0, 0, v.x,
+        0, 1, 0, v.y,
+        0, 0, 1, v.z,
+        0, 0, 0, 1
+    );
+}
+
+float4x4 rotate(float3 rotation) {
+    float3 c = cos(rotation);
+    float3 s = sin(rotation);
+
+    const float4x4 rx = float4x4(
+        1, 0, 0, 0,
+        0, c.x, -s.x, 0,
+        0, s.x, c.x, 0,
+        0, 0, 0, 1
+    );
+
+    const float4x4 ry = float4x4(
+        c.y, 0, s.y, 0,
+        0, 1, 0, 0,
+        -s.y, 0, c.y, 0,
+        0, 0, 0, 1
+    );
+
+    const float4x4 rz = float4x4(
+        c.z, -s.z, 0, 0,
+        s.z, c.z, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    );
+
+    return mul(mul(rx, ry), rz);
+}
+
+void swap(inout float a, inout float b) {
+    const float temp = a;
+    a = b;
+    b = temp;
+}
+
+// https://gist.github.com/mattatz/86fff4b32d198d0928d0fa4ff32cf6fa
+float4x4 inverse(float4x4 m) {
+    float n11 = m[0][0], n12 = m[1][0], n13 = m[2][0], n14 = m[3][0];
+    float n21 = m[0][1], n22 = m[1][1], n23 = m[2][1], n24 = m[3][1];
+    float n31 = m[0][2], n32 = m[1][2], n33 = m[2][2], n34 = m[3][2];
+    float n41 = m[0][3], n42 = m[1][3], n43 = m[2][3], n44 = m[3][3];
+
+    float t11 = n23 * n34 * n42 - n24 * n33 * n42 + n24 * n32 * n43 - n22 * n34 * n43 - n23 * n32 * n44 + n22 * n33 * n44;
+    float t12 = n14 * n33 * n42 - n13 * n34 * n42 - n14 * n32 * n43 + n12 * n34 * n43 + n13 * n32 * n44 - n12 * n33 * n44;
+    float t13 = n13 * n24 * n42 - n14 * n23 * n42 + n14 * n22 * n43 - n12 * n24 * n43 - n13 * n22 * n44 + n12 * n23 * n44;
+    float t14 = n14 * n23 * n32 - n13 * n24 * n32 - n14 * n22 * n33 + n12 * n24 * n33 + n13 * n22 * n34 - n12 * n23 * n34;
+
+    float det = n11 * t11 + n21 * t12 + n31 * t13 + n41 * t14;
+    float idet = 1.0f / det;
+
+    float4x4 ret;
+
+    ret[0][0] = t11 * idet;
+    ret[0][1] = (n24 * n33 * n41 - n23 * n34 * n41 - n24 * n31 * n43 + n21 * n34 * n43 + n23 * n31 * n44 - n21 * n33 * n44) * idet;
+    ret[0][2] = (n22 * n34 * n41 - n24 * n32 * n41 + n24 * n31 * n42 - n21 * n34 * n42 - n22 * n31 * n44 + n21 * n32 * n44) * idet;
+    ret[0][3] = (n23 * n32 * n41 - n22 * n33 * n41 - n23 * n31 * n42 + n21 * n33 * n42 + n22 * n31 * n43 - n21 * n32 * n43) * idet;
+
+    ret[1][0] = t12 * idet;
+    ret[1][1] = (n13 * n34 * n41 - n14 * n33 * n41 + n14 * n31 * n43 - n11 * n34 * n43 - n13 * n31 * n44 + n11 * n33 * n44) * idet;
+    ret[1][2] = (n14 * n32 * n41 - n12 * n34 * n41 - n14 * n31 * n42 + n11 * n34 * n42 + n12 * n31 * n44 - n11 * n32 * n44) * idet;
+    ret[1][3] = (n12 * n33 * n41 - n13 * n32 * n41 + n13 * n31 * n42 - n11 * n33 * n42 - n12 * n31 * n43 + n11 * n32 * n43) * idet;
+
+    ret[2][0] = t13 * idet;
+    ret[2][1] = (n14 * n23 * n41 - n13 * n24 * n41 - n14 * n21 * n43 + n11 * n24 * n43 + n13 * n21 * n44 - n11 * n23 * n44) * idet;
+    ret[2][2] = (n12 * n24 * n41 - n14 * n22 * n41 + n14 * n21 * n42 - n11 * n24 * n42 - n12 * n21 * n44 + n11 * n22 * n44) * idet;
+    ret[2][3] = (n13 * n22 * n41 - n12 * n23 * n41 - n13 * n21 * n42 + n11 * n23 * n42 + n12 * n21 * n43 - n11 * n22 * n43) * idet;
+
+    ret[3][0] = t14 * idet;
+    ret[3][1] = (n13 * n24 * n31 - n14 * n23 * n31 + n14 * n21 * n33 - n11 * n24 * n33 - n13 * n21 * n34 + n11 * n23 * n34) * idet;
+    ret[3][2] = (n14 * n22 * n31 - n12 * n24 * n31 - n14 * n21 * n32 + n11 * n24 * n32 + n12 * n21 * n34 - n11 * n22 * n34) * idet;
+    ret[3][3] = (n12 * n23 * n31 - n13 * n22 * n31 + n13 * n21 * n32 - n11 * n23 * n32 - n12 * n21 * n33 + n11 * n22 * n33) * idet;
+
+    return ret;
+}
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+bool IntersectsCube(Ray ray, float3 cubePos, float3 cubeRotation, float cubeScale, out float distance, out float3 normal) {
+    // Construct the cube's transformation matrix
+    const float4x4 cubeTransform = mul(translate(cubePos), rotate(cubeRotation));
+
+    // Invert the cube's transformation matrix
+    const float4x4 invCubeTransform = inverse(cubeTransform);
+
+    // Transform the ray to the cube's local space
+    Ray localRay;
+    localRay.origin = mul(invCubeTransform, float4(ray.origin, 1)).xyz;
+    localRay.direction = mul(invCubeTransform, float4(ray.direction, 0)).xyz;
+
+    // Perform a ray-AABB intersection test
+    float3 tMin = (-cubeScale - localRay.origin) / localRay.direction;
+    float3 tMax = (cubeScale - localRay.origin) / localRay.direction;
+
+    if (tMin.x > tMax.x) swap(tMin.x, tMax.x);
+    if (tMin.y > tMax.y) swap(tMin.y, tMax.y);
+    if (tMin.z > tMax.z) swap(tMin.z, tMax.z);
+
+    const float tNear = max(max(tMin.x, tMin.y), tMin.z);
+    const float tFar = min(min(tMax.x, tMax.y), tMax.z);
+
+    // If the ray intersects the cube, set the distance to the nearest intersection point
+    if (tNear <= tFar && tFar >= 0) {
+        distance = tNear;
+
+        // Determine the normal vector
+        if (tNear == tMin.x) normal = float3(-1, 0, 0);
+        else if (tNear == tMin.y) normal = float3(0, -1, 0);
+        else normal = float3(0, 0, -1);
+
+        // Transform the normal vector back to world space
+        normal = mul(float4(normal, 0), rotate(cubeRotation)).xyz;
+
+        return true;
+    }
+
+    // If the ray does not intersect the cube, set the distance to -1
+    distance = -1;
+    normal = float3(0, 0, 0);
+    return false;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = GetUV(id);
+
+    const float3 cameraPos = _CameraPos;
+    const float3 cameraDir = _CameraDir;
+    
+    int hitCount = 0;
+    float smallestDistance = 1000000.0f;
+    float3 smallestNormal = float3(0, 0, 0);
+    // Shoot a ray from the camera in the direction of the pixel
+    // If the ray hits a cube, increment hitCount
+    for (int i = 0; i < 72*72*72; i++) {
+        float4 data = _Data[i];
+        float3 rotation = data.xyz;
+
+        // Convert the rotation to radians
+        rotation = rotation * 3.14159265359f / 180.0f;
+        
+        float scale = data.w;
+
+        // Calculate the position of the ray based on the uv
+        float3 rayPos = float3(uv.x * 1.2f - 0.6f, uv.y * 1.2f - 0.6f, 0) + cameraPos;
+        float3 rayDir = normalize(cameraDir);
+
+        // Shoot the ray
+        float3 cubePos = float3(0, 0, 0);
+
+        Ray ray;
+        ray.origin = rayPos;
+        ray.direction = rayDir;
+
+        float distance;
+        float3 normal;
+        if (IntersectsCube(ray, cubePos, rotation, scale, distance, normal)) {
+            hitCount++;
+            if (distance < smallestDistance) {
+                smallestDistance = distance;
+            }
+        }
+    }
+    
+    float hitRatio = hitCount == (72.0f * 72.0f * 72.0f) ? (1.0f - (smallestDistance - 8.0f)) * 4.0f : 0.0f;
+    
+    const int colorId = id.x + id.y * 256;
+    _Result[colorId] = float4(hitRatio, hitRatio, hitRatio, 1.0f);
+}

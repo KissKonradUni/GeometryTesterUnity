@@ -1,0 +1,162 @@
+// ReSharper disable CppInconsistentNaming
+// ReSharper disable CppParameterMayBeConst
+// ReSharper disable CppLocalVariableMayBeConst
+
+#pragma kernel CSMain
+
+RWBuffer<float4> _Result;
+// Packed data of cubes
+// - Vector3 rotation
+// - float scale
+RWStructuredBuffer<float4> _Data;
+
+cbuffer _RenderData
+{
+    float3 _CameraPos;
+    float3 _CameraDir;
+    float2 _Resolution;
+    int    _NumCubes;
+
+    float3 _SmallCubeRotation;
+    float  _SmallCubeScale;
+}
+
+float2 GetUV (uint3 id) {
+    return float2(id.x / _Resolution.x, id.y / _Resolution.y);
+}
+
+struct Cube
+{
+    float3 rotation;
+    float scale;
+};
+
+Cube GetCube (uint id) {
+    Cube cube;
+    cube.rotation = _Data[id].xyz;
+    cube.scale = _Data[id].w;
+    return cube;
+}
+
+#define PI 3.14159265359
+#define RAD_TO_DEG (180.0 / PI)
+#define DEG_TO_RAD (PI / 180.0)
+
+float3 EulerToRadians(float3 euler)
+{
+    return euler * DEG_TO_RAD;
+}
+
+float3x3 RotationMatrix(float3 radians)
+{
+    float3x3 rotationX = float3x3(
+        1, 0, 0,
+        0, cos(radians.x), -sin(radians.x),
+        0, sin(radians.x), cos(radians.x)
+    );
+
+    float3x3 rotationY = float3x3(
+        cos(radians.y), 0, sin(radians.y),
+        0, 1, 0,
+        -sin(radians.y), 0, cos(radians.y)
+    );
+
+    float3x3 rotationZ = float3x3(
+        cos(radians.z), -sin(radians.z), 0,
+        sin(radians.z), cos(radians.z), 0,
+        0, 0, 1
+    );
+
+    return mul(mul(rotationX, rotationY), rotationZ);
+}
+
+bool IsPointInCube(Cube cube, float3 p)
+{
+    // Convert the rotation to a rotation matrix
+    const float3x3 rotationMatrix = RotationMatrix(EulerToRadians(cube.rotation));
+
+    // Transform the point to the cube's local space
+    const float3 localPoint = mul(p, transpose(rotationMatrix));
+
+    // Check if the point is within the cube
+    return all(abs(localPoint) <= cube.scale / 2);
+}
+
+float3 ForwardToEuler(float3 forward)
+{
+    float3 euler;
+
+    // Calculate the yaw angle
+    euler.y = atan2(forward.x, forward.z);
+
+    // Calculate the pitch angle
+    float horizontalDistance = sqrt(forward.x * forward.x + forward.z * forward.z);
+    euler.x = atan2(forward.y, horizontalDistance);
+
+    // Roll is usually 0 if we don't have a specific up vector
+    euler.z = 0;
+
+    return euler;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = GetUV(id);
+
+    // Shoot a ray from the camera in the direction of the pixel, until the point is 3 units away from the center
+
+    // Calculate an offset vector
+    float3 offset = float3(uv, 0) - float3(0.5, 0.5, 0);
+    // Apply the ray direction to the offset
+    float3x3 cameraRotation = RotationMatrix(ForwardToEuler(_CameraDir));
+    float3 rotatedOffset = mul(offset, cameraRotation);
+    // Calculate the ray origin and direction
+    float3 rayOrigin = _CameraPos;
+    float3 rayDir = normalize(_CameraDir) + rotatedOffset * 0.1f;
+
+    int steps = 0;
+    while (length(rayOrigin) > 2 && steps < 1000)
+    {
+        rayOrigin += rayDir * 0.1;
+        steps++;
+    }
+
+    float result = 0.0f;
+    float isInsideSmallCube = 0.0f;
+    
+    // When the ray is in range, we march it until it gets too far
+    while (length(rayOrigin) < 2)
+    {
+        rayOrigin += rayDir * 0.05;
+
+        // Check if the point is inside ALL of the cubes
+        bool isInsideAllCubes = true;
+        for (int i = 0; i < _NumCubes; i++)
+        {
+            Cube cube = GetCube(i);
+            if (!IsPointInCube(cube, rayOrigin))
+            {
+                isInsideAllCubes = false;
+                break;
+            }
+        }
+
+        // Check for the small cube
+        Cube smallCube;
+        smallCube.rotation = _SmallCubeRotation;
+        smallCube.scale = _SmallCubeScale;
+        if (IsPointInCube(smallCube, rayOrigin))
+            isInsideSmallCube += 0.1f;
+
+        // If the point is inside all of the cubes, we increment the result
+        if (isInsideAllCubes)
+            result += 0.1f;
+    }
+
+    // Set the color of the pixel based on the result
+    float color = result / 2.0f;
+    
+    const int colorId = id.x + id.y * _Resolution.x;
+    _Result[colorId] = float4(color + isInsideSmallCube, color, color, color + isInsideSmallCube);
+}
